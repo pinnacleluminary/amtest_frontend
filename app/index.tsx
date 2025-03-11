@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   StyleSheet, 
   Text, 
@@ -6,7 +6,8 @@ import {
   Alert, 
   ActivityIndicator, 
   SafeAreaView,
-  TouchableOpacity
+  TouchableOpacity,
+  ScrollView
 } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
@@ -15,8 +16,26 @@ import * as XLSX from 'xlsx';
 import { WebView } from 'react-native-webview';
 import { useRouter } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Sharing from 'expo-sharing';
 import { API_ENDPOINTS } from './config/api';
-import ViewShot from 'react-native-view-shot';
+
+// Define types
+interface User {
+  id: string;
+  email: string;
+}
+
+interface ApiResponse {
+  token?: string;
+  user?: User;
+  pdfBase64?: string;
+  reportData?: {
+    reportHTML?: string;
+    [key: string]: any;
+  };
+  msg?: any;
+  error?: string;
+}
 
 // Auth utility functions
 const TOKEN_KEY = 'token';
@@ -30,6 +49,15 @@ export const getToken = async (): Promise<string | null> => {
   }
 };
 
+export const saveToken = async (token: string): Promise<void> => {
+  try {
+    await AsyncStorage.setItem(TOKEN_KEY, token);
+  } catch (error) {
+    console.error('Error saving token:', error);
+    throw error;
+  }
+};
+
 export const logout = async (): Promise<void> => {
   try {
     await AsyncStorage.removeItem(TOKEN_KEY);
@@ -39,16 +67,16 @@ export const logout = async (): Promise<void> => {
   }
 };
 
-export default function App() {
+export default function App(): JSX.Element {
   const router = useRouter();
   const [loading, setLoading] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [htmlContent, setHtmlContent] = useState<string>('');
   const [sheetName, setSheetName] = useState<string>('');
-  const [capturingImage, setCapturingImage] = useState<boolean>(false);
-  const webViewRef = useRef<WebView | null>(null);
-  // Use the correct type for ViewShot from the library
-  const viewShotRef = useRef<ViewShot>(null);
+  const [processingExcel, setProcessingExcel] = useState<boolean>(false);
+  const [reportHtml, setReportHtml] = useState<string>('');
+  const [pdfUri, setPdfUri] = useState<string>('');
+  const [excelFilename, setExcelFilename] = useState<string>('');
 
   useEffect(() => {
     checkAuthStatus();
@@ -88,9 +116,11 @@ export default function App() {
         setLoading(false);
         return;
       }
-
+  
       // Read the file
-      const { uri } = result.assets[0];
+      const { uri, name } = result.assets[0];
+      setExcelFilename(name || `excel_${Date.now()}.xlsx`);
+      
       const fileContent = await FileSystem.readAsStringAsync(uri, {
         encoding: FileSystem.EncodingType.Base64,
       });
@@ -113,27 +143,17 @@ export default function App() {
       console.log(`Using sheet: ${selectedSheetName}`);
       setSheetName(selectedSheetName);
       
-      // Get the worksheet
+      // Get the worksheet and convert to HTML for display
       const worksheet = workbook.Sheets[selectedSheetName];
       
-      // Check if worksheet is valid and has a reference range
       if (!worksheet || !worksheet['!ref']) {
         Alert.alert('Error', `The worksheet "${selectedSheetName}" is empty or invalid.`);
         setLoading(false);
         return;
       }
       
-      let html;
-      try {
-        html = XLSX.utils.sheet_to_html(worksheet);
-      } catch (sheetError) {
-        console.error('Error converting sheet to HTML:', sheetError);
-        Alert.alert('Error', 'Failed to convert worksheet to HTML format.');
-        setLoading(false);
-        return;
-      }
-      
-      // Add some styling to make it look better
+      // Convert to HTML for display
+      const html = XLSX.utils.sheet_to_html(worksheet);
       const styledHtml = `
         <html>
           <head>
@@ -170,34 +190,23 @@ export default function App() {
         </html>
       `;
       
-      const response = await fetch("https://api.x.ai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer xai-NdtET7QFy1ryaevqBV2OkRqMlSetc0NnopM3KVnaPpJ3mZZLc3NnfYC1sP2N65Ia4kE6C6KZVacEVhjv`,
-        },
-        body: JSON.stringify({
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are Grok, a chatbot inspired by the Hitchhikers Guide to the Galaxy.",
-            },
-            {
-              role: "user",
-              content: styledHtml + '\n What is this content?',
-            },
-          ],
-          model: "grok-beta",
-          stream: false,
-          temperature: 0,
-        }),
-      });
-
-      const data = await response.json();
-
-      console.log(data); 
       setHtmlContent(styledHtml);
+      
+      // Send Excel data to backend for processing
+      try {
+        setProcessingExcel(true);
+        
+        // Send both the Excel file and the styled HTML to the backend
+        await sendExcelAndHtmlToBackend(fileContent, styledHtml, name || `excel_${Date.now()}.xlsx`, selectedSheetName);
+        
+        console.log('Excel file and HTML sent to backend for processing');
+      } catch (sendError) {
+        console.error('Error sending data to backend:', sendError);
+        Alert.alert('Error', `Failed to send data to backend: ${sendError instanceof Error ? sendError.message : 'Unknown error'}`);
+      } finally {
+        setProcessingExcel(false);
+      }
+      
       setLoading(false);
       
     } catch (error) {
@@ -207,54 +216,12 @@ export default function App() {
     }
   };
 
-  const captureAndSendWebView = async (): Promise<void> => {
-    try {
-      if (!htmlContent) {
-        Alert.alert('Error', 'No content to capture');
-        return;
-      }
-
-      setCapturingImage(true);
-
-      // Wait for WebView to fully render
-      setTimeout(async () => {
-        try {
-          // Use non-null assertion operator to tell TypeScript that we'll handle the null check
-          const viewShot = viewShotRef.current;
-          
-          if (!viewShot) {
-            throw new Error('ViewShot reference is not available');
-          }
-          
-          // Use type assertion to tell TypeScript that capture method exists
-          const uri = await (viewShot as any).capture();
-          
-          console.log('Image captured:', uri);
-          
-          // Convert to base64
-          const base64Image = await FileSystem.readAsStringAsync(uri, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
-          
-          // Send to backend
-          await sendImageToBackend(base64Image);
-          
-          Alert.alert('Success', 'Excel content captured and sent to server');
-        } catch (error) {
-          console.error('Capture error:', error);
-          Alert.alert('Error', `Failed to capture WebView content: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        } finally {
-          setCapturingImage(false);
-        }
-      }, 1000); // Give WebView time to render completely
-    } catch (error) {
-      console.error('Error in capture process:', error);
-      setCapturingImage(false);
-      Alert.alert('Error', 'Failed to process capture');
-    }
-  };
-
-  const sendImageToBackend = async (base64Image: string): Promise<any> => {
+  const sendExcelAndHtmlToBackend = async (
+    base64Excel: string, 
+    htmlContent: string, 
+    filename: string, 
+    sheetName: string
+  ): Promise<ApiResponse | undefined> => {
     try {
       const token = await getToken();
       
@@ -262,20 +229,84 @@ export default function App() {
         throw new Error('Image parser endpoint is not defined in API_ENDPOINTS');
       }
       
-      const response = await axios.post(
+      // Send both the Excel file and the styled HTML to the backend
+      const response = await axios.post<ApiResponse>(
         API_ENDPOINTS.imageparser, 
         {
-          image: base64Image,
-          filename: `excel_${Date.now()}.png`,
+          excelFile: base64Excel,
+          htmlContent: htmlContent,
+          filename: filename,
           sheetName: sheetName
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': token ? `Bearer ${token}` : undefined
+          }
         }
       );
       
-      console.log('Image upload response:', response.data);
+      console.log('Backend processing response received');
+      
+      // If the server returns the PDF and report data
+      if (response.data && response.data.pdfBase64) {
+        const pdfBase64 = response.data.pdfBase64;
+        const pdfFilename = `test_report_${Date.now()}.pdf`;
+        const fileUri = `${FileSystem.documentDirectory}${pdfFilename}`;
+        
+        await FileSystem.writeAsStringAsync(fileUri, pdfBase64, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+        
+        setPdfUri(fileUri);
+        console.log('PDF saved to:', fileUri);
+        
+        // If there's HTML report content, set it for display
+        if (response.data.reportData && response.data.reportData.reportHTML) {
+          setReportHtml(response.data.reportData.reportHTML);
+        }
+        
+        Alert.alert(
+          'Report Generated', 
+          'Your test report has been generated. Would you like to view or share it?',
+          [
+            {
+              text: 'View',
+              onPress: () => viewPdf(fileUri)
+            },
+            {
+              text: 'Share',
+              onPress: () => sharePdf(fileUri)
+            },
+            {
+              text: 'Close',
+              style: 'cancel'
+            }
+          ]
+        );
+      }
+      
       return response.data;
     } catch (error) {
-      console.error('Error sending image to backend:', error);
+      console.error('Error processing data on server:', error);
       throw error;
+    }
+  };
+
+  const viewPdf = (uri: string): void => {
+    // This would open the PDF in a PDF viewer
+    // For now, we'll just share it which will open in the default PDF viewer
+    sharePdf(uri);
+  };
+
+  const sharePdf = async (uri: string): Promise<void> => {
+    if (await Sharing.isAvailableAsync()) {
+      await Sharing.shareAsync(uri, {
+        mimeType: 'application/pdf',
+        dialogTitle: 'Material Test Report'
+      });
+    } else {
+      Alert.alert('Sharing not available', 'Sharing is not available on this device');
     }
   };
 
@@ -291,7 +322,7 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Excel Worksheet Viewer</Text>
+        <Text style={styles.headerTitle}>Material Test Report Generator</Text>
         <TouchableOpacity
           style={styles.logoutButton}
           onPress={handleLogout}
@@ -300,59 +331,75 @@ export default function App() {
         </TouchableOpacity>
       </View>
       
-      <View style={styles.container}>
-        <TouchableOpacity
-          style={styles.button}
-          onPress={selectExcel}
-          disabled={loading || capturingImage}
-        >
-          <Text style={styles.buttonText}>Select Excel File</Text>
-        </TouchableOpacity>
-        
-        {loading && (
-          <View style={styles.loadingContainer}>
-            <ActivityIndicator size="large" color="#0000ff" />
-            <Text>Processing Excel file...</Text>
-          </View>
-        )}
-        
-        {capturingImage && (
-          <View style={styles.loadingContainer}>
-            <ActivityIndicator size="large" color="#0000ff" />
-            <Text>Capturing and sending image...</Text>
-          </View>
-        )}
-        
-        {htmlContent ? (
-          <>
-            <View style={styles.webViewContainer}>
-              <Text style={styles.subtitle}>Worksheet: {sheetName}</Text>
-              <ViewShot 
-                ref={viewShotRef}
-                options={{ format: 'png', quality: 0.9 }}
-                style={styles.viewShot}
+      <ScrollView style={styles.scrollContainer}>
+        <View style={styles.container}>
+          <TouchableOpacity
+            style={styles.button}
+            onPress={selectExcel}
+            disabled={loading || processingExcel}
+          >
+            <Text style={styles.buttonText}>Select Excel File</Text>
+          </TouchableOpacity>
+          
+          {excelFilename ? (
+            <Text style={styles.filenameText}>Selected file: {excelFilename}</Text>
+          ) : null}
+          
+          {(loading || processingExcel) && (
+            <View style={styles.loadingContainer}>
+              <ActivityIndicator size="large" color="#0000ff" />
+              <Text>{processingExcel ? 'Generating test report...' : 'Processing Excel file...'}</Text>
+            </View>
+          )}
+          
+          {pdfUri && (
+            <View style={styles.pdfButtonsContainer}>
+              <TouchableOpacity
+                style={[styles.button, styles.pdfButton]}
+                onPress={() => viewPdf(pdfUri)}
               >
+                <Text style={styles.buttonText}>View PDF Report</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.button, styles.pdfButton]}
+                onPress={() => sharePdf(pdfUri)}
+              >
+                <Text style={styles.buttonText}>Share PDF Report</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+          
+          {htmlContent ? (
+            <View style={styles.webViewContainer}>
+              <Text style={styles.subtitle}>Excel Data Preview: {sheetName}</Text>
+              <View style={styles.webViewWrapper}>
                 <WebView
-                  ref={webViewRef}
                   originWhitelist={['*']}
                   source={{ html: htmlContent }}
                   style={styles.webView}
                   javaScriptEnabled={true}
-                  onLoadEnd={() => console.log('WebView loaded')}
+                  onLoadEnd={() => console.log('Excel WebView loaded')}
                 />
-              </ViewShot>
+              </View>
             </View>
-            
-            <TouchableOpacity
-              style={[styles.button, { marginTop: 20, backgroundColor: '#4CAF50' }]}
-              onPress={captureAndSendWebView}
-              disabled={loading || capturingImage}
-            >
-              <Text style={styles.buttonText}>Capture and Send to Server</Text>
-            </TouchableOpacity>
-          </>
-        ) : null}
-      </View>
+          ) : null}
+          
+          {reportHtml ? (
+            <View style={styles.webViewContainer}>
+              <Text style={styles.subtitle}>Test Report</Text>
+              <View style={styles.webViewWrapper}>
+                <WebView
+                  originWhitelist={['*']}
+                  source={{ html: reportHtml }}
+                  style={styles.webView}
+                  javaScriptEnabled={true}
+                  onLoadEnd={() => console.log('Report WebView loaded')}
+                />
+              </View>
+            </View>
+          ) : null}
+        </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -361,6 +408,9 @@ const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
     backgroundColor: '#fff',
+  },
+  scrollContainer: {
+    flex: 1,
   },
   loadingScreen: {
     flex: 1,
@@ -398,6 +448,11 @@ const styles = StyleSheet.create({
     marginTop: 10,
     marginBottom: 10,
   },
+  filenameText: {
+    marginTop: 10,
+    marginBottom: 10,
+    fontStyle: 'italic',
+  },
   loadingContainer: {
     marginTop: 20,
     alignItems: 'center',
@@ -405,13 +460,12 @@ const styles = StyleSheet.create({
   webViewContainer: {
     marginTop: 20,
     width: '100%',
-    flex: 1,
     borderWidth: 1,
     borderColor: '#ccc',
     borderRadius: 5,
   },
-  viewShot: {
-    flex: 1,
+  webViewWrapper: {
+    height: 400, // Fixed height for WebView
     width: '100%',
   },
   webView: {
@@ -423,6 +477,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     width: '80%',
     alignItems: 'center',
+    marginVertical: 10,
   },
   buttonText: {
     color: 'white',
@@ -438,5 +493,21 @@ const styles = StyleSheet.create({
   logoutButtonText: {
     color: 'white',
     fontWeight: 'bold',
-  }
+  },
+  pdfButtonsContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    width: '100%',
+    marginVertical: 10,
+  },
+  pdfButton: {
+    width: '45%',
+  },
+  reportContainer: {
+    marginTop: 20,
+    width: '100%',
+    borderWidth: 1,
+    borderColor: '#ccc',
+    borderRadius: 5,
+  },
 });

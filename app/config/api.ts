@@ -6,4 +6,5 @@ export const API_ENDPOINTS = {
   signup: `${BASE_URL}/api/signup`,
   imageparser: `${BASE_URL}/api/imageparser`,
   profile: `${BASE_URL}/api/profile`,
+  excelAnalysis: `${BASE_URL}/api/excelAnalysis`
 };
