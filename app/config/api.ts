@@ -1,5 +1,5 @@
-// export const BASE_URL = 'https://amtestbackend-production.up.railway.app'; // Replace with your IP address
-export const BASE_URL = 'http://172.16.5.41:3000'; // Replace with your IP address
+export const BASE_URL = 'https://amtestbackend-production.up.railway.app';
+// export const BASE_URL = 'http://172.16.5.41:3000';
 
 export const API_ENDPOINTS = {
   login: `${BASE_URL}/api/login`,
